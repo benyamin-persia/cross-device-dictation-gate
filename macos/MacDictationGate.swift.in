@@ -9,6 +9,7 @@ private let modeLock = NSLock()
 private var currentMode = "UNKNOWN"
 private var lastHeartbeat = Date.distantPast
 private var windowsGateHeartbeat = Date.distantPast
+private var lastMacDictationTrigger = Date.distantPast
 private var pendingWindowsStop = false
 private var macDictationStartedByG6 = false
 var activeTap: CFMachPort?
@@ -58,6 +59,25 @@ func isForwardedG6Event(_ pid: Int64) -> Bool {
           let process = NSRunningApplication(processIdentifier: pid_t(pid)),
           let executable = process.executableURL?.lastPathComponent else { return false }
     return executable == "deskflow-core"
+}
+
+func triggerMacDictation(_ origin: String) {
+    guard isMacAllowed() else {
+        print("G6_TRIGGER_IGNORED_NOT_ON_MAC origin=\(origin)")
+        fflush(stdout)
+        return
+    }
+    let now = Date()
+    if now.timeIntervalSince(lastMacDictationTrigger) < 0.8 {
+        print("G6_DUPLICATE_TRIGGER_SUPPRESSED origin=\(origin)")
+        fflush(stdout)
+        return
+    }
+    lastMacDictationTrigger = now
+    macDictationStartedByG6 = true
+    sendDictationShortcut()
+    print("G6_MAC_DICTATION_TRIGGER origin=\(origin)")
+    fflush(stdout)
 }
 
 func sendDictationShortcut() {
@@ -143,15 +163,7 @@ func startControlReceiver() {
             case "G6_GATE_ALIVE": setWindowsGateHeartbeat()
             case "G6_REMOTE_TRIGGER":
                 DispatchQueue.main.async {
-                    if isMacAllowed() {
-                        macDictationStartedByG6 = true
-                        sendDictationShortcut()
-                        print("G6_MAC_DICTATION_DIRECT_TRIGGER_FROM_WINDOWS")
-                        fflush(stdout)
-                    } else {
-                        print("G6_REMOTE_TRIGGER_IGNORED_OFF_MAC")
-                        fflush(stdout)
-                    }
+                    triggerMacDictation("direct-windows-udp")
                 }
             default: break
             }
@@ -177,11 +189,10 @@ let callback: CGEventTapCallBack = { _, kind, event, _ in
         }
         if key == 4 && flags.contains(.maskCommand) && !flags.contains(.maskControl) && !flags.contains(.maskAlternate) && isForwardedG6Event(pid) {
             // Preserve the existing Command+H => Option+H mapping, but gate it by control location.
-            if isMacAllowed() && !isWindowsGateActive() {
+            if isMacAllowed() {
                 if kind == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
                     DispatchQueue.main.async {
-                        macDictationStartedByG6 = true
-                        sendDictationShortcut()
+                        triggerMacDictation("deskflow-forwarded-command-h")
                     }
                     print("G6_TO_DICTATION_OPTION_H pid=\(pid)"); fflush(stdout)
                 }
