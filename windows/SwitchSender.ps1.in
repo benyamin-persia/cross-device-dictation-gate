@@ -1,0 +1,42 @@
+$ErrorActionPreference = 'Continue'
+$logPath = '__DESKFLOW_LOG_PATH__'
+$stateLog = Join-Path $env:LOCALAPPDATA 'CrossDeviceDictationGate\G6-switch-sender.log'
+$mutex = New-Object System.Threading.Mutex($false, 'Local\CrossDeviceDictationGateSender')
+if (-not $mutex.WaitOne(0)) { exit 0 }
+$client = $null
+$lastState = ''
+try {
+    $client = New-Object System.Net.Sockets.UdpClient
+    $client.Client.Bind((New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse('__WINDOWS_IP__'),0)))
+    $destIP = [System.Net.IPAddress]::Parse('__MAC_IP__')
+    $destination = New-Object System.Net.IPEndPoint($destIP,__UDP_PORT__)
+    Add-Content -Path $stateLog -Value ('START ' + (Get-Date -Format o))
+    while ($true) {
+        try {
+            if (Test-Path $logPath) {
+                $switch = Get-Content -Path $logPath -Tail 40 -ErrorAction Stop | Where-Object { $_ -match 'INFO: switch from ' } | Select-Object -Last 1
+                if ($switch -and $switch -match 'switch from "([^"]+)" to "([^"]+)"') {
+                    $target = $Matches[2]
+                    if ($target -eq '__MAC_SCREEN_NAME__') { $mode = 'MAC' }
+                    elseif ($target -eq '__WINDOWS_SCREEN_NAME__') { $mode = 'WIN' }
+                    else { $mode = '' }
+                    if ($mode) {
+                        $message = [Text.Encoding]::ASCII.GetBytes('G6_CONTROL_' + $mode)
+                        [void]$client.Send($message,$message.Length,$destination)
+                        if ($mode -ne $lastState) {
+                            Add-Content -Path $stateLog -Value ((Get-Date -Format o) + ' MODE=' + $mode)
+                            $lastState = $mode
+                        }
+                    }
+                }
+            }
+        } catch {
+            Add-Content -Path $stateLog -Value ((Get-Date -Format o) + ' ERROR=' + $_.Exception.Message)
+        }
+        Start-Sleep -Milliseconds 200
+    }
+} finally {
+    if ($client) { $client.Close() }
+    $mutex.ReleaseMutex()
+    $mutex.Dispose()
+}
