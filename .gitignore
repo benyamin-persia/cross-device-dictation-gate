@@ -1,0 +1,18 @@
+# Never publish user-specific settings, logs, or compiled binaries
+*.exe
+*.app/
+*.dll
+*.pdb
+*.log
+*.backup-*
+*.settings
+connection.conf
+settings.local.*
+*.plist.backup-*
+.DS_Store
+__pycache__/
+.vs/
+build/
+dist/
+.env
+.env.*
