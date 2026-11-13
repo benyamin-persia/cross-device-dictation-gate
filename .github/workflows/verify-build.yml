@@ -1,0 +1,30 @@
+name: Verify cross-platform builds
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and validate Windows package without installing
+        shell: powershell
+        run: |
+          .\windows\install.ps1 -WindowsIp '10.20.30.10' -MacIp '10.20.30.20' -WindowsScreenName 'WIN' -MacScreenName 'MAC' -ValidateOnly
+
+  macos-validate:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and validate Mac package without installing
+        run: |
+          bash -n macos/install.sh
+          bash -n macos/uninstall.sh
+          bash -n macos/Setup.command
+          bash macos/install.sh --windows-ip 10.20.30.10 --mac-ip 10.20.30.20 --validate-only
