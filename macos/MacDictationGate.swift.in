@@ -1,0 +1,218 @@
+import Cocoa
+import ApplicationServices
+import Darwin
+
+// G6-to-Dictation mapping. Audio routing and normal keyboard/mouse sharing are unchanged.
+private let switchStatePort: UInt16 = __UDP_PORT__
+private let authorizedWindowsIP = inet_addr("__WINDOWS_IP__")
+private let modeLock = NSLock()
+private var currentMode = "UNKNOWN"
+private var lastHeartbeat = Date.distantPast
+private var windowsGateHeartbeat = Date.distantPast
+private var pendingWindowsStop = false
+private var macDictationStartedByG6 = false
+var activeTap: CFMachPort?
+
+func updateMode(_ mode: String) {
+    modeLock.lock()
+    let changed = currentMode != mode
+    currentMode = mode
+    lastHeartbeat = Date()
+    if changed && mode == "WIN" { pendingWindowsStop = true }
+    modeLock.unlock()
+    if changed {
+        print("G6_MOUSE_CONTROL=\(mode)")
+        fflush(stdout)
+        if mode == "WIN" {
+            DispatchQueue.main.async { stopActiveMacDictation() }
+        }
+    }
+}
+
+func isWindowsGateActive() -> Bool {
+    modeLock.lock()
+    defer { modeLock.unlock() }
+    return Date().timeIntervalSince(windowsGateHeartbeat) < 3
+}
+func setWindowsGateHeartbeat() {
+    modeLock.lock()
+    windowsGateHeartbeat = Date()
+    modeLock.unlock()
+}
+
+func windowsIsActive() -> Bool {
+    modeLock.lock()
+    defer { modeLock.unlock() }
+    return currentMode == "WIN" && Date().timeIntervalSince(lastHeartbeat) < 2
+}
+
+func isMacAllowed() -> Bool {
+    // Fail closed: if the location sender stops, never trigger Dictation on the Mac.
+    modeLock.lock()
+    defer { modeLock.unlock() }
+    return currentMode == "MAC" && Date().timeIntervalSince(lastHeartbeat) < 2
+}
+
+func isForwardedG6Event(_ pid: Int64) -> Bool {
+    guard pid > 0,
+          let process = NSRunningApplication(processIdentifier: pid_t(pid)),
+          let executable = process.executableURL?.lastPathComponent else { return false }
+    return executable == "deskflow-core"
+}
+
+func sendDictationShortcut() {
+    let source = CGEventSource(stateID: .hidSystemState)
+    for isDown in [true, false] {
+        if let event = CGEvent(keyboardEventSource: source, virtualKey: 4, keyDown: isDown) {
+            event.flags = .maskAlternate
+            event.post(tap: .cghidEventTap)
+        }
+    }
+}
+
+// The visible Dictation HUD is optional on modern macOS; record when G6 starts Dictation.
+func dictationHudVisible() -> Bool {
+    guard let info = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID)
+          as? [[String: Any]] else { return false }
+    return info.contains { window in
+        let owner = window[kCGWindowOwnerName as String] as? String ?? ""
+        return owner == "DictationIM"
+    }
+}
+
+func stopActiveMacDictation() {
+    modeLock.lock()
+    let stopRequested = pendingWindowsStop && currentMode == "WIN"
+    if stopRequested { pendingWindowsStop = false }
+    modeLock.unlock()
+    guard stopRequested else { return }
+    // Dictation does not reliably expose a visible window on current macOS.
+    // Escape is Apple's documented stop key. Only press it if G6 started Dictation.
+    guard macDictationStartedByG6 || dictationHudVisible() else {
+        print("G6_SWITCH_WIN_NO_MAC_DICTATION_STARTED"); fflush(stdout)
+        return
+    }
+    macDictationStartedByG6 = false
+    let source = CGEventSource(stateID: .hidSystemState)
+    for down in [true, false] {
+        if let event = CGEvent(keyboardEventSource: source, virtualKey: 53, keyDown: down) {
+            event.post(tap: .cghidEventTap)
+        }
+    }
+    print("G6_DICTATION_ESCAPE_SENT_ON_SWITCH_TO_WIN")
+    fflush(stdout)
+}
+
+func startControlReceiver() {
+    DispatchQueue.global(qos: .utility).async {
+        let fd = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { fputs("G6_UDP_SOCKET_FAILED\n", stderr); return }
+        defer { Darwin.close(fd) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = switchStatePort.bigEndian
+        address.sin_addr = in_addr(s_addr: INADDR_ANY)
+        let bound = withUnsafePointer(to: &address) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else {
+            fputs("G6_UDP_BIND_FAILED errno=\(errno)\n", stderr)
+            return
+        }
+        print("G6_SWITCH_LISTENER_READY port=\(switchStatePort)")
+        fflush(stdout)
+        var buffer = [UInt8](repeating: 0, count: 128)
+        while true {
+            var sender = sockaddr_in()
+            var senderSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let received = withUnsafeMutablePointer(to: &sender) { senderPtr in
+                senderPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                    buffer.withUnsafeMutableBytes { raw in
+                        Darwin.recvfrom(fd, raw.baseAddress, raw.count, 0, sockaddrPtr, &senderSize)
+                    }
+                }
+            }
+            if received <= 0 || sender.sin_addr.s_addr != authorizedWindowsIP { continue }
+            guard let msg = String(bytes: buffer.prefix(received), encoding: .utf8) else { continue }
+            switch msg {
+            case "G6_CONTROL_MAC": updateMode("MAC")
+            case "G6_CONTROL_WIN": updateMode("WIN")
+            case "G6_GATE_ALIVE": setWindowsGateHeartbeat()
+            case "G6_REMOTE_TRIGGER":
+                DispatchQueue.main.async {
+                    if isMacAllowed() {
+                        macDictationStartedByG6 = true
+                        sendDictationShortcut()
+                        print("G6_MAC_DICTATION_DIRECT_TRIGGER_FROM_WINDOWS")
+                        fflush(stdout)
+                    } else {
+                        print("G6_REMOTE_TRIGGER_IGNORED_OFF_MAC")
+                        fflush(stdout)
+                    }
+                }
+            default: break
+            }
+        }
+    }
+}
+
+let callback: CGEventTapCallBack = { _, kind, event, _ in
+    if kind == .tapDisabledByTimeout || kind == .tapDisabledByUserInput {
+        if let tap = activeTap { CGEvent.tapEnable(tap: tap, enable: true) }
+        return Unmanaged.passUnretained(event)
+    }
+    if kind == .keyDown || kind == .keyUp {
+        let key = event.getIntegerValueField(.keyboardEventKeycode)
+        let flags = event.flags
+        let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
+        // Prevent a forwarded Option+H from restarting Mac Dictation while Windows owns input.
+        if key == 4 && flags.contains(.maskAlternate) && !flags.contains(.maskCommand) && !flags.contains(.maskControl) && isForwardedG6Event(pid) && !isMacAllowed() {
+            if kind == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                print("G6_FORWARDED_OPTION_H_BLOCKED_ON_WINDOWS pid=\(pid)"); fflush(stdout)
+            }
+            return nil
+        }
+        if key == 4 && flags.contains(.maskCommand) && !flags.contains(.maskControl) && !flags.contains(.maskAlternate) && isForwardedG6Event(pid) {
+            // Preserve the existing Command+H => Option+H mapping, but gate it by control location.
+            if isMacAllowed() && !isWindowsGateActive() {
+                if kind == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                    DispatchQueue.main.async {
+                        macDictationStartedByG6 = true
+                        sendDictationShortcut()
+                    }
+                    print("G6_TO_DICTATION_OPTION_H pid=\(pid)"); fflush(stdout)
+                }
+            } else if kind == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                print("G6_BLOCKED_ON_WINDOWS pid=\(pid)"); fflush(stdout)
+            }
+            return nil
+        }
+    }
+    return Unmanaged.passUnretained(event)
+}
+
+let mask: CGEventMask = CGEventMask(1 << CGEventType.keyDown.rawValue) | CGEventMask(1 << CGEventType.keyUp.rawValue)
+guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: mask, callback: callback, userInfo: nil) else {
+    // Launch-at-login may need explicit macOS Accessibility authorization.
+    let permissionOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+    _ = AXIsProcessTrustedWithOptions(permissionOptions)
+    let ax = AXIsProcessTrusted()
+    let listening = CGPreflightListenEventAccess()
+    let posting = CGPreflightPostEventAccess()
+    fputs("ERROR_NO_EVENT_TAP ax=\(ax) listen=\(listening) post=\(posting)\n", stderr)
+    exit(3)
+}
+activeTap = tap
+let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+CGEvent.tapEnable(tap: tap, enable: true)
+startControlReceiver()
+let timer = Timer(timeInterval: 0.7, repeats: true) { _ in
+    stopActiveMacDictation()
+}
+RunLoop.main.add(timer, forMode: .common)
+print("G6_DICTATION_READY_WITH_MOUSE_GATE"); fflush(stdout)
+CFRunLoopRun()
