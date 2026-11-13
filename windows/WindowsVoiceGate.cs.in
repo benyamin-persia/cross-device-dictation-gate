@@ -1,0 +1,201 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+
+internal static class G6WindowsVoiceGate
+{
+    const int WH_KEYBOARD_LL = 13;
+    const int WM_KEYDOWN = 0x0100;
+    const int WM_KEYUP = 0x0101;
+    const int WM_SYSKEYDOWN = 0x0104;
+    const int WM_SYSKEYUP = 0x0105;
+    const int VK_H = 0x48;
+    const int VK_LWIN = 0x5B;
+    const int VK_RWIN = 0x5C;
+    const int VK_ESCAPE = 0x1B;
+    private static readonly string directory = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CrossDeviceDictationGate");
+    private static readonly string senderLog = Path.Combine(directory, "G6-switch-sender.log");
+    private static readonly string ownLog = Path.Combine(directory, "G6WindowsVoiceGate.log");
+    private static readonly LowLevelKeyboardProc callback = KeyboardEvent;
+    private static IntPtr hook = IntPtr.Zero;
+    private static UdpClient udp;
+    private static IPEndPoint macEndpoint = new IPEndPoint(IPAddress.Parse("__MAC_IP__"), __UDP_PORT__);
+    private static System.Windows.Forms.Timer timer;
+    private static string currentMode = "UNKNOWN";
+    private static bool windowsHeld = false;
+    private static bool suppressedH = false;
+    private static bool armedWindowsDictation = false;
+    // Mark our synthetic pause hotkey so it never re-enters the G6 routing hook.
+    private static readonly UIntPtr pauseKeyMarker = new UIntPtr(0x57684856u);
+    private static readonly IntPtr pauseKeyMarkerInt = new IntPtr(0x57684856);
+    private static bool macTriggerHeld = false;
+    private static DateTime lastHeartbeat = DateTime.MinValue;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KBDLLHOOKSTRUCT {
+        public uint vkCode;
+        public uint scanCode;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int hookId, LowLevelKeyboardProc proc, IntPtr module, uint thread);
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(IntPtr hook);
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hook, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetModuleHandle(string module);
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wparam, IntPtr lparam);
+    private const uint WM_CLOSE = 0x0010;
+
+    private static void Log(string value) {
+        try { File.AppendAllText(ownLog, DateTime.Now.ToString("o") + " " + value + Environment.NewLine); }
+        catch { }
+    }
+    private static void Send(string text) {
+        try {
+            byte[] bytes = System.Text.Encoding.ASCII.GetBytes(text);
+            udp.Send(bytes, bytes.Length, macEndpoint);
+        } catch(Exception ex) { Log("UDP_SEND_ERROR " + ex.Message); }
+    }
+    private static string ReadActiveComputer() {
+        try {
+            if (!File.Exists(senderLog)) return "UNKNOWN";
+            string[] lines = File.ReadAllLines(senderLog);
+            for(int i = lines.Length - 1; i >= 0; i--) {
+                if (lines[i].Contains("MODE=MAC")) return "MAC";
+                if (lines[i].Contains("MODE=WIN")) return "WIN";
+            }
+        } catch { }
+        return "UNKNOWN";
+    }
+    private static void StopWindowsDictation(string reason) {
+        // Win+H pauses Windows Voice Typing without shutting down TextInputHost.
+        // Only send it after a Windows-side G6/Win+H press was tracked as listening.
+        if (!armedWindowsDictation) {
+            Log("WINDOWS_VOICE_PAUSE_SKIPPED_NOT_LISTENING " + reason);
+            return;
+        }
+        ThreadPool.QueueUserWorkItem(delegate(object state) {
+            Thread.Sleep(90); // Let the switch hotkeys finish before the pause.
+            if (currentMode != "MAC" || !armedWindowsDictation) {
+                Log("WINDOWS_VOICE_PAUSE_CANCELLED_SWITCH_REVERSED " + reason);
+                return;
+            }
+            try {
+                keybd_event(VK_LWIN, 0, 0, pauseKeyMarker);
+                Thread.Sleep(65);
+                keybd_event(VK_H, 0, 0, pauseKeyMarker);
+                Thread.Sleep(65);
+                keybd_event(VK_H, 0, 2, pauseKeyMarker);
+                Thread.Sleep(40);
+                keybd_event(VK_LWIN, 0, 2, pauseKeyMarker);
+                armedWindowsDictation = false;
+                Log("WINDOWS_VOICE_PAUSE_WIN_H_SENT " + reason);
+            } catch(Exception ex) { Log("WINDOWS_VOICE_PAUSE_ERROR " + ex.Message); }
+        });
+    }
+    private static void Tick(object source, EventArgs args) {
+        string next = ReadActiveComputer();
+        if(next != currentMode) {
+            string prior = currentMode;
+            currentMode = next;
+            Log("CONTROL " + prior + " -> " + next);
+            if(next == "MAC" && prior != "MAC") {
+                // Pause only a tracked active Dictation session. Do not shut down
+                // Windows Input Experience on routine mouse switches.
+                StopWindowsDictation("switch_to_mac");
+            }
+        }
+        if((DateTime.UtcNow - lastHeartbeat).TotalMilliseconds > 500) {
+            Send("G6_GATE_ALIVE");
+            lastHeartbeat = DateTime.UtcNow;
+        }
+    }
+    private static IntPtr KeyboardEvent(int code, IntPtr message, IntPtr info) {
+        if(code < 0) return CallNextHookEx(hook,code,message,info);
+        try {
+            int type = message.ToInt32();
+            bool down = type == WM_KEYDOWN || type == WM_SYSKEYDOWN;
+            bool up = type == WM_KEYUP || type == WM_SYSKEYUP;
+            KBDLLHOOKSTRUCT ev = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(info,typeof(KBDLLHOOKSTRUCT));
+            int vk = (int)ev.vkCode;
+            if (ev.dwExtraInfo == pauseKeyMarkerInt) {
+                return CallNextHookEx(hook,code,message,info);
+            }
+            if(vk == VK_LWIN || vk == VK_RWIN) {
+                if(down) windowsHeld = true;
+                if(up) { windowsHeld = false; macTriggerHeld = false; }
+            }
+            if(vk == VK_H && (windowsHeld || (GetAsyncKeyState(VK_LWIN) & 0x8000)!=0 ||
+                         (GetAsyncKeyState(VK_RWIN) & 0x8000)!=0 || suppressedH)) {
+                if(currentMode == "MAC") {
+                    if(down && !macTriggerHeld) {
+                        macTriggerHeld = true;
+                        suppressedH = true;
+                        Send("G6_CONTROL_MAC");
+                        Send("G6_REMOTE_TRIGGER");
+                        Log("MAC_G6_FORWARDED_AS_DIRECT_TRIGGER");
+                    }
+                    if(up) { suppressedH = false; macTriggerHeld = false; }
+                    // Swallow Win+H on Windows, retaining the original G6 mapping.
+                    return (IntPtr)1;
+                }
+                if(currentMode == "WIN" && down && !macTriggerHeld) {
+                    macTriggerHeld = true;
+                    armedWindowsDictation = !armedWindowsDictation;
+                    Log(armedWindowsDictation ? "WINDOWS_G6_VOICE_TOGGLED_ON" : "WINDOWS_G6_VOICE_TOGGLED_OFF");
+                }
+                if(up) macTriggerHeld = false;
+            }
+            if(vk == VK_ESCAPE && down && currentMode == "WIN")
+                armedWindowsDictation = false;
+        } catch (Exception ex) { Log("HOOK_ERROR " + ex.Message); }
+        return CallNextHookEx(hook,code,message,info);
+    }
+
+    [STAThread]
+    private static void Main() {
+        Directory.CreateDirectory(directory);
+        bool created;
+        using(var mutex = new System.Threading.Mutex(true, "Local\\CrossDeviceDictationGateSingleton", out created)) {
+            if(!created) return;
+            udp = new UdpClient(new IPEndPoint(IPAddress.Parse("__WINDOWS_IP__"), 0));
+            currentMode = ReadActiveComputer();
+            Log("START mode=" + currentMode);
+            using(Process p=Process.GetCurrentProcess()) {
+                using(ProcessModule module=p.MainModule) {
+                    hook=SetWindowsHookEx(WH_KEYBOARD_LL, callback, GetModuleHandle(module.ModuleName), 0);
+                }
+            }
+            if(hook==IntPtr.Zero) {
+                Log("HOOK_CREATE_FAILED WIN32ERROR="+Marshal.GetLastWin32Error());
+                return;
+            }
+            Log("KEYBOARD_HOOK_READY");
+            timer = new System.Windows.Forms.Timer();
+            timer.Interval = 150;
+            timer.Tick += Tick;
+            timer.Start();
+            Send("G6_GATE_ALIVE");
+            Application.Run(new ApplicationContext());
+            timer.Stop();
+            UnhookWindowsHookEx(hook);
+            udp.Dispose();
+        }
+    }
+}
