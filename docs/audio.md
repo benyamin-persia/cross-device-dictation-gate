@@ -22,7 +22,7 @@ Audio transfer is independent of the keyboard/mouse screen status. Both SonoBus 
 
 ## Windows Firewall
 
-If SonoBus shows a peer but reports \`Other side is muted\` / \`0ch\` despite a moving input meter, test whether Windows Firewall blocks inbound local UDP traffic for SonoBus.
+If SonoBus shows a peer but reports `Other side is muted` / `0ch` despite a moving input meter, test whether Windows Firewall blocks inbound local UDP traffic for SonoBus.
 
 For local-network safety, allow **only SonoBus.exe**, only inbound **UDP**, only from the Mac's LAN IP, and only on the needed local profiles. This may require administrator approval. Never disable the entire firewall as a workaround.
 
